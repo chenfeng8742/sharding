@@ -42,7 +42,7 @@ func GetUsers(cluster *sharding.Cluster, accountId int64) ([]User, error) {
 }
 
 // createShard creates database schema for a given shard.
-func createShard(shard *pg.DB) error {
+func createShard(shard *sharding.Shard) error {
 	queries := []string{
 		`DROP SCHEMA IF EXISTS ?shard CASCADE`,
 		`CREATE SCHEMA ?shard`,

@@ -4,23 +4,22 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"strconv"
 	"sync"
 
 	"gopkg.in/pg.v5"
-	"gopkg.in/pg.v5/types"
 )
 
 // Cluster maps many (up to 8198) logical database shards implemented
 // using PostgreSQL schemas to far fewer physical PostgreSQL servers.
 type Cluster struct {
 	dbs, servers []*pg.DB
-	shards       []*pg.DB
+	shards       []*Shard
 }
 
+// 增加对外部设置分片名称前缀的支持[prefix]
 // NewCluster returns new PostgreSQL cluster consisting of physical
 // dbs and running nshards logical shards.
-func NewCluster(dbs []*pg.DB, nshards int) *Cluster {
+func NewCluster(dbs []*pg.DB, nshards int, prefix string) *Cluster {
 	if len(dbs) == 0 {
 		panic("at least one db is required")
 	}
@@ -38,13 +37,13 @@ func NewCluster(dbs []*pg.DB, nshards int) *Cluster {
 	}
 	cl := &Cluster{
 		dbs:    dbs,
-		shards: make([]*pg.DB, nshards),
+		shards: make([]*Shard, nshards),
 	}
-	cl.init()
+	cl.init(prefix)
 	return cl
 }
 
-func (cl *Cluster) init() {
+func (cl *Cluster) init(prefix string) {
 	dbSet := make(map[*pg.DB]struct{})
 	for _, db := range cl.dbs {
 		if _, ok := dbSet[db]; ok {
@@ -55,15 +54,8 @@ func (cl *Cluster) init() {
 	}
 
 	for i := 0; i < len(cl.shards); i++ {
-		cl.shards[i] = newShard(cl.dbs[i%len(cl.dbs)], int64(i))
+		cl.shards[i] = NewShard(int64(i), cl.dbs[i%len(cl.dbs)], prefix)
 	}
-}
-
-func newShard(db *pg.DB, id int64) *pg.DB {
-	name := "shard" + strconv.FormatInt(id, 10)
-	return db.WithParam("shard_id", id).
-		WithParam("shard", types.F(name)).
-		WithParam("epoch", epoch)
 }
 
 func (cl *Cluster) Close() error {
@@ -88,13 +80,13 @@ func (cl *Cluster) DBs() []*pg.DB {
 
 // Shards returns list of shards running in the db. If db is nil all
 // shards are returned.
-func (cl *Cluster) Shards(db *pg.DB) []*pg.DB {
+func (cl *Cluster) Shards(db *pg.DB) []*Shard {
 	if db == nil {
 		return cl.shards
 	}
-	var shards []*pg.DB
-	for i, shard := range cl.shards {
-		if cl.dbs[i%len(cl.dbs)] == db {
+	var shards []*Shard
+	for _, shard := range cl.shards {
+		if shard.DB == db {
 			shards = append(shards, shard)
 		}
 	}
@@ -102,13 +94,13 @@ func (cl *Cluster) Shards(db *pg.DB) []*pg.DB {
 }
 
 // Shard maps the number to a shard in the cluster.
-func (cl *Cluster) Shard(number int64) *pg.DB {
-	number = number % int64(len(cl.shards))
+func (cl *Cluster) Shard(number int64) *Shard {
+	number = number%int64(len(cl.shards)-1) + 1
 	return cl.shards[number]
 }
 
 // ShardString maps the str to a shard in the cluster.
-func (cl *Cluster) ShardString(str string) *pg.DB {
+func (cl *Cluster) ShardString(str string) *Shard {
 	h := fnv.New32a()
 	io.WriteString(h, str)
 	return cl.Shard(int64(h.Sum32()))
@@ -116,7 +108,7 @@ func (cl *Cluster) ShardString(str string) *pg.DB {
 
 // SplitShard uses SplitId to extract shard id from the id and then
 // returns corresponding cluster Shard.
-func (cl *Cluster) SplitShard(id int64) *pg.DB {
+func (cl *Cluster) SplitShard(id int64) *Shard {
 	_, shardId, _ := SplitId(id)
 	return cl.Shard(shardId)
 }
@@ -145,8 +137,7 @@ func (cl *Cluster) ForEachDB(fn func(db *pg.DB) error) error {
 }
 
 // ForEachShard concurrently calls the fn on each shard in the cluster.
-// It is the same as ForEachNShards(1, fn).
-func (cl *Cluster) ForEachShard(fn func(db *pg.DB) error) error {
+func (cl *Cluster) ForEachShard(fn func(shard *Shard) error) error {
 	return cl.ForEachDB(func(db *pg.DB) error {
 		var retErr error
 		for _, shard := range cl.Shards(db) {
@@ -155,38 +146,5 @@ func (cl *Cluster) ForEachShard(fn func(db *pg.DB) error) error {
 			}
 		}
 		return retErr
-	})
-}
-
-// ForEachNShards concurrently calls the fn on each N shards in the cluster.
-func (cl *Cluster) ForEachNShards(n int, fn func(db *pg.DB) error) error {
-	return cl.ForEachDB(func(db *pg.DB) error {
-		var wg sync.WaitGroup
-		errCh := make(chan error, 1)
-		limit := make(chan struct{}, n)
-		for _, shard := range cl.Shards(db) {
-			limit <- struct{}{}
-			wg.Add(1)
-			go func(shard *pg.DB) {
-				defer func() {
-					<-limit
-					wg.Done()
-				}()
-				if err := fn(shard); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-				}
-			}(shard)
-		}
-		wg.Wait()
-
-		select {
-		case err := <-errCh:
-			return err
-		default:
-			return nil
-		}
 	})
 }

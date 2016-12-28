@@ -1,4 +1,4 @@
-package sharding // import "gopkg.in/go-pg/sharding.v5"
+package sharding
 
 import (
 	"fmt"
